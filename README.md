@@ -77,6 +77,49 @@ The one deliberate simplification: **eager, no graph fusion** (one StableHLO pro
 per aten op, cached). Real PyTorch/XLA traces a whole step into one HLO graph and
 lets XLA fuse it; we keep every op's lowering visible and self-contained.
 
+## How a program reaches the TPU
+
+The **program (code)** and the **tensors (data)** travel by two separate paths and
+only meet at execute time. "The program" here is one tiny StableHLO module per aten
+op, e.g. a matmul becomes `func.func @main(%a, %b) { stablehlo.dot_general ... }`.
+
+```
+program path (once per unique op):
+  StableHLO text ──PJRT_Client_Compile──► [libtpu: XLA TPU compiler → TPU binary
+                                           → loaded into device runtime] ──► Executable handle
+                                                                   (cached by program text)
+data path (per call):
+  numpy ──PJRT_Client_BufferFromHostBuffer──► HBM buffer handle
+
+execute:
+  Executable handle + input buffer handles ──PJRT_LoadedExecutable_Execute──►
+       TPU runs the loaded program on the TensorCore ──► output handles + completion event
+```
+
+1. **Cross the C boundary** (`pjrt.compile`). The StableHLO text is wrapped in a
+   `PJRT_Program` struct — just `(char* code, size_t code_size, format="mlir")` — and
+   passed to `PJRT_Client_Compile` (one function pointer in the ctypes-modeled
+   `PJRT_Api` table), along with a 6-byte hand-serialized `CompileOptionsProto`
+   (`num_replicas=1, num_partitions=1`).
+2. **libtpu compiles + loads** (host-side). It parses the MLIR, runs the XLA TPU
+   compiler pipeline (StableHLO → MHLO → HLO → optimize/layout/fuse → **TPU machine
+   code**), and **loads that binary into the device runtime** — this is the actual
+   "transfer to the TPU". It returns a `PJRT_LoadedExecutable*` handle. After this the
+   program is resident on the chip and never crosses again.
+3. **Compile once, reuse** (`hlo.run`). The `Executable` is cached keyed by the exact
+   module text (which encodes op + shapes + dtypes), so step 0 compiles ~all ops and
+   later steps only dispatch.
+4. **Data path, separate** (`pjrt.from_host`). `PJRT_Client_BufferFromHostBuffer`
+   streams a numpy array into TPU HBM and returns an opaque on-device buffer handle.
+5. **Execute binds them** (`pjrt._execute`). `PJRT_LoadedExecutable_Execute` takes the
+   executable handle + input buffer handles (**only handles cross — no tensor bytes**),
+   the TPU runtime dispatches the loaded program to the TensorCore, writes outputs to
+   new HBM buffers, and signals a `PJRT_Event` we await (making each op synchronous).
+
+This is the same `PJRT_Client_Compile` / `Execute` path real PyTorch/XLA uses into the
+same libtpu — the only difference is granularity: torch_xla compiles one HLO graph per
+step; here each aten op is its own StableHLO program, so you can watch every one go down.
+
 ## Is the backend "registered"? (the pure-Python limit)
 
 Two ways to add a backend to PyTorch:
