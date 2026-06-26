@@ -183,13 +183,14 @@ def matmul_throughput(n: int = 2048, iters: int = 50) -> float:
     """Measured GFLOP/s of an n×n matmul on the TPU (proof of real compute)."""
     import time
     import numpy as np
-    from . import tensor as T
-    a = T.from_numpy(np.random.randn(n, n).astype(np.float32))
-    b = T.from_numpy(np.random.randn(n, n).astype(np.float32))
-    T.mm(a, b).numpy()                       # warm/compile
+    from . import ops
+    a = ops.from_np(np.random.randn(n, n).astype(np.float32))
+    b = ops.from_np(np.random.randn(n, n).astype(np.float32))
+    ops.mm(a, b).to_numpy()                  # warm/compile
     t0 = time.perf_counter()
     for _ in range(iters):
-        T.mm(a, b).numpy()
+        c = ops.mm(a, b)
+    c.to_numpy()                             # ensure the last execute completed
     dt = time.perf_counter() - t0
     flops = 2.0 * n ** 3 * iters
     return flops / dt / 1e9

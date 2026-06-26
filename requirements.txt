@@ -1,4 +1,5 @@
-# Runtime: numpy + a TPU VM with libtpu installed (no torch / torch_xla / jax).
+# A real PyTorch backend: needs torch + a TPU VM with libtpu. No torch_xla / jax.
+torch>=2.6             # CPU build is fine — we provide the TPU device ourselves
 numpy>=1.24
-libtpu>=0.0.17        # the PJRT plugin (pip install libtpu, or use a TPU VM image)
-requests             # examples/ only: downloads the tiny-shakespeare dataset
+libtpu>=0.0.17         # the PJRT plugin (pip install libtpu, or use a TPU VM image)
+requests               # examples/ only: downloads the tiny-shakespeare dataset
