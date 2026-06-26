@@ -118,10 +118,33 @@ def collect_profile(model, opt, make_batch, V, logdir, prof_steps):
     print(f"inspect with:   xprof -l {logdir} -p 8791")
 
 
+@torch.no_grad()
+def generate(model, V, L, stoi, itos, prompt, max_new_tokens, temperature=0.8, top_k=40):
+    """nanoGPT-style sampling. Each step's forward runs on the TPU (fixed block_size
+    window -> cached executable); softmax/top-k/multinomial sampling is on the host."""
+    out = [stoi[c] for c in prompt if c in stoi] or [0]
+    for _ in range(max_new_tokens):
+        window = out[-L:]
+        if len(window) < L:
+            window = [0] * (L - len(window)) + window          # left-pad to block_size
+        idx = torch.tensor([window], dtype=torch.long)          # [1, L]
+        logits = xb.to_cpu(model(idx).detach())[0, -1] / temperature   # forward on TPU
+        if top_k:
+            v, _ = torch.topk(logits, min(top_k, V))
+            logits[logits < v[-1]] = -float("inf")
+        probs = torch.softmax(logits, dim=-1)
+        out.append(int(torch.multinomial(probs, 1)))
+    return "".join(itos[i] for i in out)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--profile", type=str, default=None, help="logdir to write a TPU xprof trace")
     ap.add_argument("--profile_steps", type=int, default=5)
+    ap.add_argument("--generate", type=int, default=0, help="generate N chars after training")
+    ap.add_argument("--prompt", type=str, default="\n")
+    ap.add_argument("--temperature", type=float, default=0.8)
+    ap.add_argument("--top_k", type=int, default=40)
     ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--block_size", type=int, default=64)
@@ -171,6 +194,13 @@ def main():
             print(f"Step {step:5d} | Loss: {xb.to_cpu(loss.detach()).item():.4f}", flush=True)
 
     print("\nTrained a real torch.nn model on the TPU via __torch_dispatch__.")
+
+    if args.generate:
+        itos = chars
+        print(f"\n--- generating {args.generate} chars on the TPU "
+              f"(prompt={args.prompt!r}, temp={args.temperature}, top_k={args.top_k}) ---")
+        print(generate(model, V, L, stoi, itos, args.prompt,
+                       args.generate, args.temperature, args.top_k))
 
 
 if __name__ == "__main__":

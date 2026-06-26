@@ -52,6 +52,36 @@ The model and training method are modeled after Andrej Karpathy's
 [nanoGPT](https://github.com/karpathy/nanoGPT/tree/master) — a small char-level
 transformer trained on the tiny-shakespeare dataset.
 
+### Generate text
+
+`--generate N` samples N characters autoregressively after training (nanoGPT-style:
+each step's forward runs on the TPU, the softmax/top-k/multinomial sampling on the host):
+
+```
+$ python examples/train_torch.py --steps 1200 --generate 500 --prompt $'\n' --temperature 0.8 --top_k 40
+...
+Step  1199 | Loss: 2.1765
+
+--- generating 500 chars on the TPU (prompt='\n', temp=0.8, top_k=40) ---
+
+BALAnELLELAARAS:
+Ans hite toreathed head to'lis, fand bouresiriss singe,
+
+Gas wewnd ant ting Pand pardses heat ald non thell
+
+And hourd shird fof the sornore arste wook, thell your he,
+And heeach ast I ming sirn lures igtheanod! frerd itd,
+Tans aill fith wablest to so but.
+
+Noor IISir I I Hrethet sus bray shas, worly,
+And merd greall omand rend getuers hill. frer, tavent ther wis me eand tooures
+Bet ban her will sovechan 's yow thell theurtsererth
+```
+
+A 0.29M-param char model at loss ~2.2 — rough, but it has clearly learned the *shape*
+of Shakespeare: speaker labels (`NAME:`), line breaks, capitalization, and common
+words / word-fragments. Train longer (or bigger) for cleaner text.
+
 ## How it works
 
 - **`pjrt.py`** — a ctypes client over `libtpu.so`'s PJRT C API: model the whole
