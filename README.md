@@ -48,6 +48,10 @@ Step   100 | Loss: 2.8965
 Step   199 | Loss: 2.5965
 ```
 
+The model and training method are modeled after Andrej Karpathy's
+[nanoGPT](https://github.com/karpathy/nanoGPT/tree/master) — a small char-level
+transformer trained on the tiny-shakespeare dataset.
+
 ## How it works
 
 - **`pjrt.py`** — a ctypes client over `libtpu.so`'s PJRT C API: model the whole
@@ -241,7 +245,7 @@ optimizer ran on the TPU, not on the host.
 
 `train_torch.py --profile <logdir>` writes an xprof `xplane.pb` of the on-device op
 timeline (pure-Python, no torch_xla); inspect it with `xprof -l <logdir>`. See profiler
-screenshot:
+screenshot to prove that model actually executed on TPU:
 
 ![mini-pytorch-xla op timeline in xprof](assets/mini-pytorch-xla-profiler.png)
 
