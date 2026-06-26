@@ -79,9 +79,108 @@ lets XLA fuse it; we keep every op's lowering visible and self-contained.
 
 ## How a program reaches the TPU
 
-The **program (code)** and the **tensors (data)** travel by two separate paths and
-only meet at execute time. "The program" here is one tiny StableHLO module per aten
-op, e.g. a matmul becomes `func.func @main(%a, %b) { stablehlo.dot_general ... }`.
+The key thing to understand up front: **the program (code) and the tensors (data)
+travel by two completely separate paths**, and they only meet at execute time.
+
+### What "the program" is
+
+In this backend there's no one big program — **each aten op becomes its own tiny
+StableHLO module**. When `__torch_dispatch__` intercepts, say, a matmul, `ops.py`
+builds a text module:
+
+```mlir
+module {
+  func.func public @main(%a: tensor<4x5xf32>, %b: tensor<5x6xf32>) -> tensor<4x6xf32> {
+    %r = "stablehlo.dot_general"(%a, %b) {...} : (...) -> tensor<4x6xf32>
+    return %r : tensor<4x6xf32>
+  }
+}
+```
+
+That **string** is "the program." Transferring it to the TPU is two steps:
+**compile+load** (the focus here), then **execute**.
+
+### Step 1 — the program crosses the C boundary (`pjrt.compile`)
+
+The StableHLO text is wrapped in a `PJRT_Program` struct and handed to libtpu through
+the PJRT C API:
+
+```python
+code = stablehlo_text.encode("utf-8")          # the program, as bytes
+prog.code      = <pointer to code>;  prog.code_size = len(code)
+prog.format    = b"mlir";            prog.format_size = 4   # "this is StableHLO MLIR"
+a.program          = &prog
+a.compile_options  = <6-byte CompileOptionsProto>   # num_replicas=1, num_partitions=1
+self._raw_call("PJRT_Client_Compile", a)        # call into libtpu
+```
+
+Mechanically: `PJRT_Client_Compile` is one function pointer in the `PJRT_Api` table
+modeled in ctypes; calling it is `fn(&args)` where `args` carries a **pointer + length**
+for the program bytes and the format tag `"mlir"`. So the program crosses the
+Python↔C boundary as nothing more than `(char* code, size_t code_size, char* "mlir")`.
+
+### Step 2 — libtpu compiles it and loads it onto the device
+
+Inside `PJRT_Client_Compile`, libtpu does the heavy lifting **on the host CPU**:
+
+1. Parses the StableHLO MLIR text.
+2. Runs the **XLA TPU compiler pipeline**: StableHLO → MHLO → HLO →
+   optimization/layout/fusion → **TPU machine code** (the actual TensorCore program).
+3. **Loads that binary into the TPU runtime** — this is the actual "transfer to the
+   TPU": the compiled program is placed in device program memory / registered with the
+   on-device runtime so it's ready to dispatch.
+4. Returns a `PJRT_LoadedExecutable*` handle (wrapped as `Executable`).
+
+So "transferred to the TPU" really means: **host-side compilation produces a device
+binary, and that binary is loaded onto the chip.** After `compile` returns, the program
+is resident on the TPU; nothing about it needs to cross again.
+
+### Step 3 — compile once, reuse forever (`hlo.run`)
+
+Compilation is the expensive part (hundreds of ms), so the `Executable` is **cached
+keyed by the exact program text**:
+
+```python
+exe = _EXE_CACHE.get(module_text)
+if exe is None:
+    exe = pjrt.client().compile(module_text); _EXE_CACHE[module_text] = exe
+return exe.execute(inputs)
+```
+
+Because the module text encodes the op *and* the input shapes/dtypes, every training
+step after the first reuses step 0's loaded executables — step 0 compiles ~all the ops,
+later steps just dispatch. (That's why the op profile shows steady ~160 µs/op: that's
+execute, not compile.)
+
+### Step 4 — the data path (separate)
+
+The tensors never travel with the program. `pjrt.from_host` streams a numpy array to
+TPU HBM via `PJRT_Client_BufferFromHostBuffer`, returning an opaque `PJRT_Buffer*`
+**handle** that lives on the device. The program and the data are now both on the chip,
+independently.
+
+### Step 5 — execute binds program + data (`pjrt._execute`)
+
+`PJRT_LoadedExecutable_Execute` is where they meet:
+
+```python
+in_arr = (c_vp * n_in)(*[b._h for b in inputs])   # array of device buffer HANDLES
+a.executable             = exe._h     # the loaded program on the TPU
+a.argument_lists         = &in_arr    # its input HBM buffers (by handle)
+a.output_lists           = &out_arr   # where output handles come back
+a.device_complete_events = &complete
+self._raw_call("PJRT_LoadedExecutable_Execute", a)
+self._await(complete[0])              # block until the TPU finishes this op
+```
+
+**Only handles cross here** — no tensor bytes. We pass the executable handle + input
+buffer handles; libtpu's runtime dispatches the already-loaded program to the
+TensorCore with those HBM inputs, writes outputs to new HBM buffers, and signals a
+`PJRT_Event`. We `_await` it so the op is synchronous (which is what makes the eager
+op-timeline profile faithful). Outputs stay in HBM as handles until something calls
+`to_numpy` (`PJRT_Buffer_ToHostBuffer`).
+
+### The whole picture
 
 ```
 program path (once per unique op):
@@ -89,36 +188,17 @@ program path (once per unique op):
                                            → loaded into device runtime] ──► Executable handle
                                                                    (cached by program text)
 data path (per call):
-  numpy ──PJRT_Client_BufferFromHostBuffer──► HBM buffer handle
+  numpy ──BufferFromHostBuffer──► HBM buffer handle
 
 execute:
-  Executable handle + input buffer handles ──PJRT_LoadedExecutable_Execute──►
+  Executable handle + input buffer handles ──LoadedExecutable_Execute──►
        TPU runs the loaded program on the TensorCore ──► output handles + completion event
 ```
 
-1. **Cross the C boundary** (`pjrt.compile`). The StableHLO text is wrapped in a
-   `PJRT_Program` struct — just `(char* code, size_t code_size, format="mlir")` — and
-   passed to `PJRT_Client_Compile` (one function pointer in the ctypes-modeled
-   `PJRT_Api` table), along with a 6-byte hand-serialized `CompileOptionsProto`
-   (`num_replicas=1, num_partitions=1`).
-2. **libtpu compiles + loads** (host-side). It parses the MLIR, runs the XLA TPU
-   compiler pipeline (StableHLO → MHLO → HLO → optimize/layout/fuse → **TPU machine
-   code**), and **loads that binary into the device runtime** — this is the actual
-   "transfer to the TPU". It returns a `PJRT_LoadedExecutable*` handle. After this the
-   program is resident on the chip and never crosses again.
-3. **Compile once, reuse** (`hlo.run`). The `Executable` is cached keyed by the exact
-   module text (which encodes op + shapes + dtypes), so step 0 compiles ~all ops and
-   later steps only dispatch.
-4. **Data path, separate** (`pjrt.from_host`). `PJRT_Client_BufferFromHostBuffer`
-   streams a numpy array into TPU HBM and returns an opaque on-device buffer handle.
-5. **Execute binds them** (`pjrt._execute`). `PJRT_LoadedExecutable_Execute` takes the
-   executable handle + input buffer handles (**only handles cross — no tensor bytes**),
-   the TPU runtime dispatches the loaded program to the TensorCore, writes outputs to
-   new HBM buffers, and signals a `PJRT_Event` we await (making each op synchronous).
-
-This is the same `PJRT_Client_Compile` / `Execute` path real PyTorch/XLA uses into the
-same libtpu — the only difference is granularity: torch_xla compiles one HLO graph per
-step; here each aten op is its own StableHLO program, so you can watch every one go down.
+This is exactly the mechanism real PyTorch/XLA uses — the same `PJRT_Client_Compile` /
+`Execute` calls into the same libtpu. The only difference is granularity: torch_xla
+traces a whole training step into **one** HLO graph and compiles that once; here each
+aten op is its own StableHLO module, so you can see every program go down the wire.
 
 ## Is the backend "registered"? (the pure-Python limit)
 
