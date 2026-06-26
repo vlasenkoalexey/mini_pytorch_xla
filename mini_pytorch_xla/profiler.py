@@ -142,6 +142,59 @@ class Trace:
         return False
 
 
+# --------------------------------------------------------------------------- #
+# Minimal protobuf + XSpace (tensorflow.profiler) writer — no protoc, no deps.
+# Lets us emit an xplane.pb that xprof / TensorBoard's Trace Viewer can open,
+# built from the on-device op timeline (eager ops run sequentially + synchronously,
+# so laying their measured durations end-to-end is a faithful TPU trace).
+# --------------------------------------------------------------------------- #
+def _varint(n: int) -> bytes:
+    n &= (1 << 64) - 1
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        out.append(b | 0x80 if n else b)
+        if not n:
+            return bytes(out)
+
+
+def _vint(field, val):
+    return _varint(field << 3) + _varint(int(val))
+
+
+def _ld(field, data):                       # length-delimited (string / submessage)
+    return _varint((field << 3) | 2) + _varint(len(data)) + data
+
+
+def _str(field, s):
+    return _ld(field, s.encode("utf-8"))
+
+
+def build_xspace(events, plane="/device:TPU:0", line="XLA Ops", host="tpu") -> bytes:
+    """events: list of (op_name, duration_seconds) in execution order."""
+    names = {}
+    for name, _ in events:
+        names.setdefault(name, len(names) + 1)        # metadata_id per unique op
+    # XEvent: metadata_id=1, offset_ps=2, duration_ps=3
+    xevents, off_ps = b"", 0
+    for name, dur_s in events:
+        dur_ps = int(dur_s * 1e12)
+        xevents += _ld(4, _vint(1, names[name]) + _vint(2, off_ps) + _vint(3, dur_ps))  # XLine.events=4
+        off_ps += dur_ps
+    # XLine: id=1, name=2, timestamp_ns=3, events=4
+    xline = _vint(1, 1) + _str(2, line) + _vint(3, 0) + xevents
+    # XPlane.event_metadata map<int64,XEventMetadata> field 4; XEventMetadata: id=1, name=2
+    meta = b""
+    for name, mid in names.items():
+        entry = _vint(1, mid) + _ld(2, _vint(1, mid) + _str(2, name))   # map entry key=1,value=2
+        meta += _ld(4, entry)
+    # XPlane: id=1, name=2, lines=3, event_metadata=4
+    xplane = _vint(1, 1) + _str(2, plane) + _ld(3, xline) + meta
+    # XSpace: planes=1, hostnames=4
+    return _ld(1, xplane) + _str(4, host)
+
+
 class OpProfile:
     """On-device operator timing profile. Each timed op's wall-time includes the
     PJRT await of device completion, so it reflects real TPU execution time."""
@@ -151,6 +204,7 @@ class OpProfile:
         self.calls = defaultdict(int)
         self.secs = defaultdict(float)
         self.compiles = defaultdict(int)
+        self.events = []                    # (op_name, duration_s) in order
 
     def __enter__(self):
         from . import hlo
@@ -167,6 +221,17 @@ class OpProfile:
         self.secs[kind] += seconds
         if compiled:
             self.compiles[kind] += 1
+        self.events.append((kind, seconds))
+
+    def write_xspace(self, logdir, run="minixla"):
+        """Write the timeline as <logdir>/plugins/profile/<run>/<host>.xplane.pb (xprof)."""
+        import os
+        d = os.path.join(logdir, "plugins", "profile", run)
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "mini-pytorch-xla.xplane.pb")
+        with open(path, "wb") as f:
+            f.write(build_xspace(self.events))
+        return path
 
     def report(self) -> str:
         rows = sorted(self.secs.items(), key=lambda kv: -kv[1])

@@ -81,8 +81,47 @@ class LLM(nn.Module):
         return self.head(self.lnf(x))
 
 
+def train_step(model, opt, x, y, V):
+    logits = model(x)
+    logp = F.log_softmax(logits.reshape(-1, V), dim=-1)
+    onehot = xb.to_xla(F.one_hot(y.reshape(-1), V).float())
+    loss = -(logp * onehot).sum(dim=-1).mean()
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+    return loss
+
+
+def collect_profile(model, opt, make_batch, V, logdir, prof_steps):
+    """Capture an on-device op profile of the backend and write an xprof xplane.pb.
+
+    Uses the project's own profiler (mini_pytorch_xla.profiler) — no torch_xla / jax.
+    Each StableHLO op is timed across the PJRT device-completion barrier; since eager
+    ops run sequentially+synchronously, the timeline is faithful. Written as an XSpace
+    (xplane.pb) that xprof / TensorBoard's Trace Viewer reads.
+    """
+    from mini_pytorch_xla import profiler
+
+    for _ in range(3):                           # warm up: compile all op programs
+        x, y = make_batch()
+        train_step(model, opt, x, y, V)
+
+    print(f"profiling {prof_steps} steps on the TPU -> {logdir}")
+    with profiler.OpProfile() as prof:
+        for _ in range(prof_steps):
+            x, y = make_batch()
+            loss = train_step(model, opt, x, y, V)
+            xb.to_cpu(loss.detach())             # force device completion in-window
+    print(prof.report())
+    path = prof.write_xspace(logdir)
+    print(f"\nxplane written: {path}")
+    print(f"inspect with:   xprof -l {logdir} -p 8791")
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--profile", type=str, default=None, help="logdir to write a TPU xprof trace")
+    ap.add_argument("--profile_steps", type=int, default=5)
     ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--block_size", type=int, default=64)
@@ -121,16 +160,13 @@ def main():
         y = torch.stack([data[i + 1:i + 1 + L] for i in ix])
         return x, y
 
+    if args.profile:
+        collect_profile(model, opt, batch, V, args.profile, args.profile_steps)
+        return
+
     for step in range(args.steps):
         x, y = batch()                                # ids stay on host (embedding gather)
-        logits = model(x)                             # [B, L, V] on TPU
-        # cross-entropy as -(log_softmax * onehot).sum / N  (avoids nll_loss/gather)
-        logp = F.log_softmax(logits.reshape(-1, V), dim=-1)
-        onehot = xb.to_xla(F.one_hot(y.reshape(-1), V).float())
-        loss = -(logp * onehot).sum(dim=-1).mean()
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
+        loss = train_step(model, opt, x, y, V)        # fwd+bwd+AdamW, all on TPU
         if step % args.log_every == 0 or step == args.steps - 1:
             print(f"Step {step:5d} | Loss: {xb.to_cpu(loss.detach()).item():.4f}", flush=True)
 
