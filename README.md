@@ -19,6 +19,10 @@ PyTorch's, and its backward formulas re-dispatch through us, so backward also ru
 on the TPU. Composite ops we don't implement are expanded by PyTorch's **core-aten
 decompositions** into the primitives we do.
 
+> There's also a **no-PyTorch frontend** in [`no_pytorch/`](no_pytorch/) — the original
+> version, a hand-rolled autograd `Tensor` + `nn` that depends on **no torch at all**
+> (it reuses the same `ops.py` StableHLO lowerings and `pjrt.py` runtime).
+
 ## It runs unmodified `torch.nn`
 
 ```python
