@@ -77,6 +77,30 @@ The one deliberate simplification: **eager, no graph fusion** (one StableHLO pro
 per aten op, cached). Real PyTorch/XLA traces a whole step into one HLO graph and
 lets XLA fuse it; we keep every op's lowering visible and self-contained.
 
+## Is the backend "registered"? (the pure-Python limit)
+
+Two ways to add a backend to PyTorch:
+
+1. **A registered device** (a `torch.device('tpu')` via the PrivateUse1 key, like
+   torch_xla / torch_npu) — so `cpu_tensor.to('tpu')` and `tensor.device.type=='tpu'`
+   work. This requires a **C++ `DeviceGuardImpl` + allocator** registered for the
+   device. We tried it (`rename_privateuse1_backend("tpu")` + the subclass on the
+   `tpu` device): tensors then report `device='tpu:0'` and forward ops work — but the
+   **autograd backward pass crashes** (`PyTorch is not linked with support for tpu
+   devices`), because the engine instantiates a C++ DeviceGuard for the tensor's
+   device and PrivateUse1 has none. That C++ shim is the one piece a pure-Python
+   project cannot provide.
+
+2. **A tensor-subclass + `__torch_dispatch__`** (what this does) — the *pure-Python*
+   registration mechanism, the same one functorch / quantization / tracing modes use.
+   It intercepts every aten op (forward and autograd-emitted backward) and works with
+   full autograd + `torch.optim`. The tensor reports `device='cpu'`, so entry is
+   `to_xla(t)` / `to_xla_(model)` rather than `t.to('tpu')`.
+
+So: the **op interception is genuinely registered** with PyTorch's dispatcher; the
+**device name** is the only thing missing, and adding it needs ~50–100 lines of C++.
+Everything else — Tensor, autograd, optimizer — is real PyTorch.
+
 ## Run it
 
 ```bash

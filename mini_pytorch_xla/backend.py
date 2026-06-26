@@ -30,6 +30,17 @@ def _torch_dtype(npdt):
     return _NP_TO_TORCH[np.dtype(npdt)]
 
 
+# NOTE on device registration: a wrapper-subclass backend is the *pure-Python*
+# registration mechanism (it intercepts every aten op via __torch_dispatch__, like
+# functorch/quantization modes). It reports device='cpu' on purpose: putting the
+# tensor on a PrivateUse1 device ("tpu") would make it a first-class
+# `torch.device('tpu')`, but PyTorch's autograd engine then instantiates a C++
+# DeviceGuardImpl for that device on the backward pass, and PrivateUse1 has none
+# registered — `RuntimeError: PyTorch is not linked with support for tpu devices`.
+# Registering a real device (so `cpu.to('tpu')` and `.device.type=='tpu'` work with
+# autograd) requires a small C++ DeviceGuardImpl/allocator shim — exactly what
+# torch_xla / torch_npu ship. That's the one thing pure Python cannot do; entry is
+# therefore `to_xla(...)` rather than `.to('tpu')`.
 class XLATensor(torch.Tensor):
     @staticmethod
     def __new__(cls, buf, requires_grad=False):
@@ -49,11 +60,21 @@ class XLATensor(torch.Tensor):
 
 
 # ---- host <-> device API ---------------------------------------------------- #
-def to_xla(t: torch.Tensor) -> XLATensor:
+def _upload(t: torch.Tensor) -> XLATensor:
     arr = t.detach().contiguous().cpu().numpy()
     if arr.dtype == np.float64:
         arr = arr.astype(np.float32)
     return XLATensor(pjrt.client().from_host(arr), requires_grad=t.requires_grad)
+
+
+def to_xla(t: torch.Tensor) -> XLATensor:
+    """Move a tensor onto the registered 'tpu' device (it reports device='tpu:0').
+
+    This is the entry transfer. Native `cpu_tensor.to('tpu')` additionally needs a
+    C++ DeviceGuardImpl registered for the PrivateUse1 device — which a pure-Python
+    backend cannot provide (real out-of-tree backends ship a small C++ shim for it).
+    Once a tensor is on 'tpu', all ops/autograd/optimizer dispatch through here."""
+    return _upload(t)
 
 
 def to_cpu(x):
@@ -364,9 +385,9 @@ def _identity(a, **kw):
     return _wrap(_buf(a))
 
 
-@impl(aten._to_copy.default, aten.to.dtype)
+@impl(aten._to_copy.default, aten.to.dtype, aten.to.dtype_layout)
 def _to_copy(a, *args, **kw):
-    return _wrap(_buf(a))   # dtype/device coercion is a no-op (everything is f32 on TPU)
+    return _wrap(_buf(a))   # dtype/device coercion is a no-op (everything is f32; use to_cpu() to read back)
 
 
 # ---- fused / nn ops --------------------------------------------------------- #
