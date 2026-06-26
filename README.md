@@ -239,6 +239,12 @@ python examples/profile_proof.py         # device identity + HBM + op profile + 
 executes with 0 mid-step host readbacks** — i.e. the entire forward, backward, and
 optimizer ran on the TPU, not on the host.
 
+`train_torch.py --profile <logdir>` writes an xprof `xplane.pb` of the on-device op
+timeline (pure-Python, no torch_xla); inspect it with `xprof -l <logdir>`. See profiler
+screenshot:
+
+![mini-pytorch-xla op timeline in xprof](assets/mini-pytorch-xla-profiler.png)
+
 ## Scope / limitations (intentional)
 
 - **Eager**, one StableHLO program per aten op; per-op dispatch + device sync.
