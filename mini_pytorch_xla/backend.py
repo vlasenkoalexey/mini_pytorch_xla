@@ -129,19 +129,46 @@ try:
     _DECOMP.update(get_decompositions([
         aten._softmax.default, aten._log_softmax.default,
         aten.native_layer_norm.default,
+        aten.gelu.default, aten.gelu_backward.default,   # decompose to ...erf...
     ]))
 except Exception:
     _DECOMP = {}
 
 
+# --- CPU fallback safety net ------------------------------------------------- #
+# Any op we don't lower runs on the host (download -> torch CPU op -> re-upload),
+# warning once. Heavy compute stays on the TPU; only rare ops (e.g. gather/scatter
+# in nll_loss) ever touch the host. Makes the backend handle arbitrary models.
+import warnings
+_WARNED = set()
+
+
+def _to_cpu(x):
+    return torch.from_numpy(x._buf.to_numpy()) if isinstance(x, XLATensor) else x
+
+
+def _from_cpu(x):
+    return _upload(x) if isinstance(x, torch.Tensor) else x
+
+
+def _cpu_fallback(func, args, kwargs):
+    if func not in _WARNED:
+        _WARNED.add(func)
+        warnings.warn(f"[mini-xla] CPU fallback for {func}")
+    out = func(*tree_map(_to_cpu, args), **tree_map(_to_cpu, kwargs))
+    return tree_map(_from_cpu, out)
+
+
 def _dispatch(func, args, kwargs):
     h = HANDLERS.get(func) or HANDLERS.get(getattr(func, "overloadpacket", None))
-    if h is not None:
-        return h(*args, **kwargs)
-    if func in _DECOMP:
-        return _DECOMP[func](*args, **kwargs)
-    raise NotImplementedError(f"mini-xla: no lowering for {func}  (args dtypes "
-                              f"{[getattr(a,'dtype',type(a).__name__) for a in args]})")
+    try:
+        if h is not None:
+            return h(*args, **kwargs)
+        if func in _DECOMP:
+            return _DECOMP[func](*args, **kwargs)
+    except Exception:
+        pass            # lowering/decomp failed (e.g. unsupported dtype) -> host
+    return _cpu_fallback(func, args, kwargs)
 
 
 # =========================================================================== #
@@ -246,6 +273,11 @@ def _rsqrt(a):
 @impl(aten.tanh.default)
 def _tanh(a):
     return _wrap(ops.unary("tanh", _buf(a)))
+
+
+@impl(aten.erf.default)
+def _erf(a):
+    return _wrap(ops.erf(_buf(a)))            # real erf on the TPU -> real gelu
 
 
 @impl(aten.reciprocal.default)

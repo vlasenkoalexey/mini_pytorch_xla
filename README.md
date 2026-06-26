@@ -287,9 +287,13 @@ screenshot to prove that model actually executed on TPU:
 
 - **Eager**, one StableHLO program per aten op; per-op dispatch + device sync.
 - f32 + bf16-matmul (TPU MXU default); single device; no collectives.
-- relu (not erf-gelu) and dropout=0 in the example, to stay within the op set.
-- embedding is one-hot @ table (avoids gather/scatter); token ids stay on host.
-- ~40 aten primitives implemented; composites handled by core-aten decompositions.
+- real **erf-gelu** (via `chlo.erf`) and **`F.cross_entropy`** run through the backend;
+  dropout=0 in the example (a no-op).
+- embedding is one-hot @ table (on the TPU); cross_entropy's `nll_loss` `gather`/
+  `scatter`/`where` fall back to the host — a **CPU-fallback safety net** (warns once)
+  runs any unimplemented op or unsupported dtype on CPU, so the backend handles
+  arbitrary models while heavy compute stays on the TPU.
+- ~40 aten primitives + core-aten decompositions; everything else degrades to CPU.
 - A real builder (MLIR Python bindings) would be safer than text emission, but isn't
   available without pulling in jaxlib/torch_xla or heavy MLIR wheels — so we emit
   StableHLO text and keep the project dependency-free.

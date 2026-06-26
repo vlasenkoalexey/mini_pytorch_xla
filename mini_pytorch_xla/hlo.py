@@ -16,6 +16,7 @@ from . import pjrt
 
 _NP_TO_MLIR = {
     np.dtype("float32"): "f32",
+    np.dtype("int64"): "i64",
     np.dtype("int32"): "i32",
     np.dtype("bool"): "i1",
 }

@@ -89,6 +89,15 @@ def unary(opname, a: pjrt.Buffer) -> pjrt.Buffer:
     return _run1(m, [a])
 
 
+def erf(a: pjrt.Buffer) -> pjrt.Buffer:
+    # chlo.erf legalizes to StableHLO during XLA compile -> real erf on the TPU
+    # (this is what lets gelu's decomposition run on-device).
+    T = ttype(a.shape, a.dtype)
+    m = (f'module {{\n  func.func public @main(%a: {T}) -> {T} {{\n'
+         f'    %r = "chlo.erf"(%a) : ({T}) -> {T}\n    return %r : {T}\n  }}\n}}')
+    return _run1(m, [a])
+
+
 def compare(direction, a: pjrt.Buffer, b: pjrt.Buffer) -> pjrt.Buffer:
     """Elementwise compare -> bool buffer. direction in {GE,GT,LE,LT,EQ,NE}."""
     out = bshape(a.shape, b.shape)

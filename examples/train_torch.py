@@ -56,7 +56,7 @@ class Block(nn.Module):
 
     def forward(self, x, mask):
         x = x + self.attn(self.n1(x), mask)
-        x = x + self.f2(F.relu(self.f1(self.n2(x))))
+        x = x + self.f2(F.gelu(self.f1(self.n2(x))))
         return x
 
 
@@ -83,9 +83,7 @@ class LLM(nn.Module):
 
 def train_step(model, opt, x, y, V):
     logits = model(x)
-    logp = F.log_softmax(logits.reshape(-1, V), dim=-1)
-    onehot = xb.to_xla(F.one_hot(y.reshape(-1), V).float())
-    loss = -(logp * onehot).sum(dim=-1).mean()
+    loss = F.cross_entropy(logits.reshape(-1, V), y.reshape(-1))   # real CE; y int (host)
     opt.zero_grad()
     loss.backward()
     opt.step()
